@@ -1,22 +1,13 @@
 // ==UserScript==
 // @name        StaticResCache
 // @namespace   Violentmonkey Scripts
-// @grant       none
 // @version     1.0
 // @author      -
-// @description 2024/11/19 09:27:56
-// ==/UserScript==
-// ==UserScript==
-// @name         Static Resource Cache
-// @namespace    https://jieyibu.net/
-// @version      1.1
-// @description  Cache static resources and intercept requests
-// @author       Halo Master
-// @match        *://*/*
-// @grant        GM_xmlhttpRequest
-// @grant        GM.setValue
-// @grant        GM.getValue
-// @connect      *
+// @description 静态资源缓存
+// @match       *://*/*
+// @grant       GM_xmlhttpRequest
+// @grant       GM.xmlHttpRequest
+// @connect     *
 // ==/UserScript==
 
 (function() {
@@ -110,19 +101,20 @@
     async function updateCacheInBackground(url, cached) {
         try {
             console.log(`🔄 开始后台更新缓存: ${url}`);
-            const headers = new Headers();
+            const headers = {};
             if (cached.etag) {
                 console.log(`   └── 使用 ETag: ${cached.etag}`);
-                headers.append('If-None-Match', cached.etag);
+                headers['If-None-Match'] = cached.etag;
             }
 
-            const response = await fetch(url, { headers });
+            const response = await gmFetch(url, { headers });
 
             if (response.status === 304) {
                 await saveToCache(url, cached.data, cached.etag);
                 console.log(`📌 资源未变化，更新时间戳: ${url}`);
             } else if (response.ok) {
-                const { buffer, text } = await readResponseData(response);
+                const buffer = await response.arrayBuffer();
+                const text = new TextDecoder().decode(buffer);
                 const etag = response.headers.get('ETag');
                 await saveToCache(url, { buffer, text }, etag);
                 console.log(`📥 资源已更新: ${url}`);
@@ -135,7 +127,12 @@
     function isStaticResource(url) {
         try {
             if (!url || typeof url !== 'string') return false;
-            return STATIC_EXTENSIONS.some(ext => url.toLowerCase().endsWith(ext));
+            const staticExtensions = [
+                '.js', '.css', '.png', '.jpg', '.jpeg',
+                '.gif', '.svg', '.woff', '.woff2', '.ttf'
+            ];
+            const urlLower = url.toLowerCase();
+            return staticExtensions.some(ext => urlLower.endsWith(ext));
         } catch (error) {
             console.error('检查资源类型时出错:', error);
             return false;
@@ -244,7 +241,7 @@
         console.log('🔄 XHR 拦截器已启动');
     }
 
-    // 修改 interceptFetch 函数，增加更多日志
+    // 修改 interceptFetch 函数
     function interceptFetch() {
         const originalFetch = unsafeWindow.fetch;
         unsafeWindow.fetch = async function(resource, init) {
@@ -267,21 +264,88 @@
                             status: 200,
                             headers: new Headers({
                                 'Content-Type': url.endsWith('.js') ? 'application/javascript' :
-                                              url.endsWith('.css') ? 'text/css' : 'application/octet-stream',
+                                              url.endsWith('.css') ? 'text/css' : 
+                                              url.endsWith('.png') ? 'image/png' :
+                                              url.endsWith('.jpg') || url.endsWith('.jpeg') ? 'image/jpeg' :
+                                              url.endsWith('.gif') ? 'image/gif' :
+                                              url.endsWith('.svg') ? 'image/svg+xml' :
+                                              'application/octet-stream',
                                 'X-Cache': 'HIT'
                             })
                         });
                     }
+
+                    try {
+                        // 使用 gmFetch 获取资源
+                        const response = await gmFetch(url, init);
+                        if (response.ok) {
+                            const buffer = await response.arrayBuffer();
+                            const text = new TextDecoder().decode(buffer);
+                            const etag = response.headers.get('ETag');
+                            await saveToCache(url, { buffer, text }, etag);
+                            
+                            // 返回一个新的 Response 对象
+                            return new Response(buffer, {
+                                status: response.status,
+                                headers: response.headers
+                            });
+                        }
+                        return response;
+                    } catch (fetchError) {
+                        console.error(`使用 gmFetch 失败，尝试原始 fetch: ${url}`, fetchError);
+                        return originalFetch.apply(this, arguments);
+                    }
                 }
+
+                // 非静态资源使用原始 fetch
+                return originalFetch.apply(this, arguments);
             } catch (error) {
                 console.error('Fetch 拦截出错:', error);
+                // 发生错误时回退到原始 fetch
+                return originalFetch.apply(this, arguments);
             }
-
-            return originalFetch.apply(this, arguments);
         };
         console.log('🔄 Fetch 拦截器已启动');
     }
 
+    // 添加 GM_xmlhttpRequest 包装函数
+    function gmFetch(url, options = {}) {
+        const gmRequest = typeof GM_xmlhttpRequest !== 'undefined' ? 
+            GM_xmlhttpRequest : 
+            GM.xmlHttpRequest;
+
+        if (!gmRequest) {
+            console.error('未找到 GM_xmlhttpRequest 或 GM.xmlHttpRequest，请检查脚本权限设置');
+            return Promise.reject(new Error('GM_xmlhttpRequest not available'));
+        }
+
+        return new Promise((resolve, reject) => {
+            gmRequest({
+                method: options.method || 'GET',
+                url: url,
+                headers: options.headers || {},
+                responseType: 'arraybuffer',
+                onload: function(response) {
+                    resolve({
+                        ok: response.status >= 200 && response.status < 300,
+                        status: response.status,
+                        headers: new Headers(response.responseHeaders.split('\r\n').reduce((headers, line) => {
+                            const [key, value] = line.split(': ');
+                            if (key && value) headers[key] = value;
+                            return headers;
+                        }, {})),
+                        arrayBuffer: () => Promise.resolve(response.response)
+                    });
+                },
+                onerror: function(error) {
+                    console.error(`请求失败: ${url}`, error);
+                    reject(error);
+                }
+            });
+        });
+    }
+
+    // 修改 cacheResource 函数
     async function cacheResource(url) {
         try {
             if (!url || !isStaticResource(url)) return;
@@ -296,9 +360,11 @@
                 return;
             }
 
-            const response = await fetch(url);
+            console.log(`🔄 开始获取资源: ${url}`);
+            const response = await gmFetch(url);
             if (response.ok) {
-                const { buffer, text } = await readResponseData(response);
+                const buffer = await response.arrayBuffer();
+                const text = new TextDecoder().decode(buffer);
                 const etag = response.headers.get('ETag');
                 console.log('预缓存资源到磁盘:', url);
                 await saveToCache(url, { buffer, text }, etag);
