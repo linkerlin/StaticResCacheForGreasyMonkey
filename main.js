@@ -60,8 +60,17 @@
             const store = transaction.objectStore(STORE_NAME);
             const request = store.get(url);
 
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => {
+                console.warn(`🔍 缓存读取失败: ${url}`, request.error);
+                reject(request.error);
+            };
+            request.onsuccess = () => {
+                if (request.result) {
+                    const age = (Date.now() - request.result.timestamp) / 1000;
+                    console.log(`✅ 缓存命中: ${url}\n   └── 缓存时间: ${age.toFixed(2)}秒前\n   └── 数据大小: ${(request.result.data.buffer.byteLength / 1024).toFixed(2)}KB`);
+                }
+                resolve(request.result);
+            };
         });
     }
 
@@ -77,8 +86,17 @@
                 timestamp: Date.now()
             });
 
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve();
+            const size = (data.buffer.byteLength / 1024).toFixed(2);
+            console.log(`💾 正在缓存: ${url}\n   └── 数据大小: ${size}KB${etag ? '\n   └── ETag: ' + etag : ''}`);
+
+            request.onerror = () => {
+                console.error(`❌ 缓存保存失败: ${url}`, request.error);
+                reject(request.error);
+            };
+            request.onsuccess = () => {
+                console.log(`✅ 缓存保存成功: ${url}`);
+                resolve();
+            };
         });
     }
 
@@ -91,26 +109,26 @@
     // 后台更新缓存
     async function updateCacheInBackground(url, cached) {
         try {
+            console.log(`🔄 开始后台更新缓存: ${url}`);
             const headers = new Headers();
             if (cached.etag) {
+                console.log(`   └── 使用 ETag: ${cached.etag}`);
                 headers.append('If-None-Match', cached.etag);
             }
 
             const response = await fetch(url, { headers });
 
             if (response.status === 304) {
-                // 资源未变化，仅更新时间戳
                 await saveToCache(url, cached.data, cached.etag);
-                console.log('缓存资源未变化:', url);
+                console.log(`📌 资源未变化，更新时间戳: ${url}`);
             } else if (response.ok) {
-                // 资源已更新，保存新版本
                 const { buffer, text } = await readResponseData(response);
                 const etag = response.headers.get('ETag');
                 await saveToCache(url, { buffer, text }, etag);
-                console.log('缓存资源已更新:', url);
+                console.log(`📥 资源已更新: ${url}`);
             }
         } catch (error) {
-            console.error('后台更新缓存失败:', url, error);
+            console.error(`❌ 后台更新失败: ${url}`, error);
         }
     }
 
@@ -142,6 +160,42 @@
         return { buffer, text };
     }
 
+    // 添加 MutationObserver 来监听 DOM 变化
+    function observeDOMChanges() {
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType === 1) { // 元素节点
+                        // 检查新添加的元素中的资源
+                        const resources = [
+                            ...Array.from(node.getElementsByTagName('script') || []),
+                            ...Array.from(node.getElementsByTagName('link') || []),
+                            ...Array.from(node.getElementsByTagName('img') || [])
+                        ];
+                        
+                        // 如果节点本身是资源节点，也加入检查
+                        if (['SCRIPT', 'LINK', 'IMG'].includes(node.tagName)) {
+                            resources.push(node);
+                        }
+
+                        resources.forEach(resource => {
+                            const url = resource.src || resource.href;
+                            if (url) cacheResource(url);
+                        });
+                    }
+                });
+            });
+        });
+
+        observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true
+        });
+
+        console.log('🔍 DOM 变化监听器已启动');
+    }
+
+    // 修改 interceptXHR 函数，增加更多日志
     function interceptXHR() {
         const XHR = unsafeWindow.XMLHttpRequest;
         unsafeWindow.XMLHttpRequest = function() {
@@ -152,6 +206,7 @@
             xhr.open = function(method, url, ...args) {
                 this._url = url;
                 this._method = method;
+                console.log(`📡 拦截到 XHR 请求: ${method} ${url}`);
                 return originalOpen.apply(this, [method, url, ...args]);
             };
 
@@ -160,7 +215,7 @@
                     try {
                         const cached = await getCached(this._url);
                         if (cached) {
-                            console.log('从磁盘缓存返回:', this._url);
+                            console.log(`🎯 XHR 请求使用缓存: ${this._url}`);
 
                             Object.defineProperty(this, 'readyState', {value: 4});
                             Object.defineProperty(this, 'status', {value: 200});
@@ -172,40 +227,24 @@
                                 this.dispatchEvent(new Event('load'));
                             }, 0);
 
-                            // 检查是否需要更新缓存
                             if (await shouldUpdate(cached)) {
-                                console.log('后台更新缓存:', this._url);
                                 updateCacheInBackground(this._url, cached);
                             }
-
                             return;
                         }
                     } catch (error) {
                         console.error('XHR 缓存读取出错:', error);
                     }
-
-                    this.addEventListener('load', async () => {
-                        if (this.status === 200) {
-                            try {
-                                console.log('缓存资源到磁盘:', this._url);
-                                const etag = this.getResponseHeader('ETag');
-                                await saveToCache(this._url, {
-                                    buffer: this.response,
-                                    text: this.responseText
-                                }, etag);
-                            } catch (error) {
-                                console.error('保存缓存失败:', error);
-                            }
-                        }
-                    });
                 }
                 return originalSend.apply(this, args);
             };
 
             return xhr;
         };
+        console.log('🔄 XHR 拦截器已启动');
     }
 
+    // 修改 interceptFetch 函数，增加更多日志
     function interceptFetch() {
         const originalFetch = unsafeWindow.fetch;
         unsafeWindow.fetch = async function(resource, init) {
@@ -213,14 +252,14 @@
                 const url = getUrlString(resource);
                 if (!url) return originalFetch.apply(this, arguments);
 
+                console.log(`📡 拦截到 Fetch 请求: ${url}`);
+
                 if ((!init || init.method === undefined || init.method === 'GET') && isStaticResource(url)) {
                     const cached = await getCached(url);
                     if (cached) {
-                        console.log('从磁盘缓存返回:', url);
+                        console.log(`🎯 Fetch 请求使用缓存: ${url}`);
 
-                        // 检查是否需要更新缓存
                         if (await shouldUpdate(cached)) {
-                            console.log('后台更新缓存:', url);
                             updateCacheInBackground(url, cached);
                         }
 
@@ -228,20 +267,11 @@
                             status: 200,
                             headers: new Headers({
                                 'Content-Type': url.endsWith('.js') ? 'application/javascript' :
-                                              url.endsWith('.css') ? 'text/css' : 'application/octet-stream'
+                                              url.endsWith('.css') ? 'text/css' : 'application/octet-stream',
+                                'X-Cache': 'HIT'
                             })
                         });
                     }
-
-                    const response = await originalFetch.apply(this, arguments);
-                    if (response.ok) {
-                        const clone = response.clone();
-                        const { buffer, text } = await readResponseData(clone);
-                        const etag = response.headers.get('ETag');
-                        console.log('缓存资源到磁盘:', url);
-                        await saveToCache(url, { buffer, text }, etag);
-                    }
-                    return response;
                 }
             } catch (error) {
                 console.error('Fetch 拦截出错:', error);
@@ -249,6 +279,7 @@
 
             return originalFetch.apply(this, arguments);
         };
+        console.log('🔄 Fetch 拦截器已启动');
     }
 
     async function cacheResource(url) {
@@ -306,8 +337,9 @@
             border-radius: 5px;
             font-size: 12px;
             z-index: 9999;
-            max-height: 200px;
+            max-height: 300px;
             overflow-y: auto;
+            min-width: 200px;
         `;
 
         const clearButton = document.createElement('button');
@@ -337,11 +369,26 @@
                     request.onerror = () => reject(request.error);
                 });
 
-                panel.innerHTML = `
-                    <div>缓存状态:</div>
-                    <div>缓存数量: ${count}</div>
-                    ${clearButton.outerHTML}
-                `;
+                // 计算总缓存大小
+                let totalSize = 0;
+                store.openCursor().onsuccess = function(event) {
+                    const cursor = event.target.result;
+                    if (cursor) {
+                        totalSize += cursor.value.data.buffer.byteLength;
+                        cursor.continue();
+                    } else {
+                        const sizeMB = (totalSize / (1024 * 1024)).toFixed(2);
+                        panel.innerHTML = `
+                            <div style="margin-bottom: 8px;">📊 缓存状态</div>
+                            <div>📦 缓存数量: ${count}</div>
+                            <div>💾 总大小: ${sizeMB} MB</div>
+                            <div style="margin-top: 8px;">
+                                <button onclick="location.reload()" style="margin-right: 5px;">🔄 刷新</button>
+                                ${clearButton.outerHTML}
+                            </div>
+                        `;
+                    }
+                };
             } catch (error) {
                 console.error('更新缓存信息失败:', error);
             }
@@ -350,21 +397,26 @@
         setInterval(updateCacheInfo, 1000);
     }
 
+    // 修改 init 函数
     async function init() {
         try {
             await initDB();
             interceptXHR();
             interceptFetch();
-
+            
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', () => {
                     cacheCurrentPageResources();
                     addDebugPanel();
+                    observeDOMChanges(); // 添加 DOM 监听
                 });
             } else {
                 cacheCurrentPageResources();
                 addDebugPanel();
+                observeDOMChanges(); // 添加 DOM 监听
             }
+            
+            console.log('🚀 静态资源缓存系统初始化完成');
         } catch (error) {
             console.error('初始化过程出错:', error);
         }
